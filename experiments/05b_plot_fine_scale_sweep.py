@@ -1,4 +1,4 @@
-# experiments/05_plot_scale_sweep.py
+# experiments/05b_plot_fine_scale_sweep.py
 
 from pathlib import Path
 
