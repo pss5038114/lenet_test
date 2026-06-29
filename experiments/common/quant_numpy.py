@@ -327,3 +327,128 @@ def lenet5_forward_int8_numpy(
         return scores, debug
 
     return scores
+
+def compute_global_scale_flow(x_scale=127.0, w_scale=16.0, shift_val=4):
+    """
+    현재 RTL처럼 layer마다 accumulator를 오른쪽 shift해서 다시 INT8 activation으로
+    만드는 구조에서, global W_SCALE을 쓸 때 각 layer의 activation scale 흐름을 계산한다.
+
+    핵심:
+      S_A,out = S_A,in * S_W / 2^SHIFT_VAL
+
+    Pooling은 max만 하므로 scale이 변하지 않는다고 본다.
+    """
+    div = float(2 ** shift_val)
+
+    scales = {}
+
+    scales["input"] = float(x_scale)
+
+    scales["conv1_in"] = scales["input"]
+    scales["conv1_bias"] = scales["conv1_in"] * float(w_scale)
+    scales["conv1_out"] = scales["conv1_bias"] / div
+
+    scales["conv2_in"] = scales["conv1_out"]
+    scales["conv2_bias"] = scales["conv2_in"] * float(w_scale)
+    scales["conv2_out"] = scales["conv2_bias"] / div
+
+    scales["fc1_in"] = scales["conv2_out"]
+    scales["fc1_bias"] = scales["fc1_in"] * float(w_scale)
+    scales["fc1_out"] = scales["fc1_bias"] / div
+
+    scales["fc2_in"] = scales["fc1_out"]
+    scales["fc2_bias"] = scales["fc2_in"] * float(w_scale)
+    scales["fc2_out"] = scales["fc2_bias"] / div
+
+    scales["fc3_in"] = scales["fc2_out"]
+    scales["fc3_bias"] = scales["fc3_in"] * float(w_scale)
+    scales["fc3_out"] = scales["fc3_bias"] / div
+
+    return scales
+
+
+def quantize_lenet5_params_global_scale_flow(
+    model,
+    x_scale=127.0,
+    w_scale=16.0,
+    shift_val=4,
+    bias_mode="round",
+):
+    """
+    다양한 W_SCALE sweep을 위한 parameter quantization.
+
+    기존 quantize_lenet5_params()는 모든 layer bias에 같은 x_scale을 썼다.
+    이 함수는 현재 RTL의 SHIFT_VAL을 고려해서 layer별 activation scale을 추적하고,
+    그에 맞춰 layer별 bias scale을 다르게 적용한다.
+    """
+    model_cpu = model.cpu()
+    scales = compute_global_scale_flow(
+        x_scale=x_scale,
+        w_scale=w_scale,
+        shift_val=shift_val,
+    )
+
+    q = {}
+
+    q["conv1_w"], conv1_w_info = quantize_int8_symmetric(
+        model_cpu.conv1.weight.detach().numpy(),
+        scale=w_scale,
+    )
+    q["conv2_w"], conv2_w_info = quantize_int8_symmetric(
+        model_cpu.conv2.weight.detach().numpy(),
+        scale=w_scale,
+    )
+    q["fc1_w"], fc1_w_info = quantize_int8_symmetric(
+        model_cpu.fc1.weight.detach().numpy(),
+        scale=w_scale,
+    )
+    q["fc2_w"], fc2_w_info = quantize_int8_symmetric(
+        model_cpu.fc2.weight.detach().numpy(),
+        scale=w_scale,
+    )
+    q["fc3_w"], fc3_w_info = quantize_int8_symmetric(
+        model_cpu.fc3.weight.detach().numpy(),
+        scale=w_scale,
+    )
+
+    q["conv1_b"] = quantize_bias_int32(
+        model_cpu.conv1.bias.detach().numpy(),
+        act_scale=scales["conv1_in"],
+        weight_scale=w_scale,
+        mode=bias_mode,
+    )
+    q["conv2_b"] = quantize_bias_int32(
+        model_cpu.conv2.bias.detach().numpy(),
+        act_scale=scales["conv2_in"],
+        weight_scale=w_scale,
+        mode=bias_mode,
+    )
+    q["fc1_b"] = quantize_bias_int32(
+        model_cpu.fc1.bias.detach().numpy(),
+        act_scale=scales["fc1_in"],
+        weight_scale=w_scale,
+        mode=bias_mode,
+    )
+    q["fc2_b"] = quantize_bias_int32(
+        model_cpu.fc2.bias.detach().numpy(),
+        act_scale=scales["fc2_in"],
+        weight_scale=w_scale,
+        mode=bias_mode,
+    )
+    q["fc3_b"] = quantize_bias_int32(
+        model_cpu.fc3.bias.detach().numpy(),
+        act_scale=scales["fc3_in"],
+        weight_scale=w_scale,
+        mode=bias_mode,
+    )
+
+    q["_scale_flow"] = scales
+    q["_quant_info"] = {
+        "conv1_w_sat_rate": conv1_w_info["sat_rate"],
+        "conv2_w_sat_rate": conv2_w_info["sat_rate"],
+        "fc1_w_sat_rate": fc1_w_info["sat_rate"],
+        "fc2_w_sat_rate": fc2_w_info["sat_rate"],
+        "fc3_w_sat_rate": fc3_w_info["sat_rate"],
+    }
+
+    return q
